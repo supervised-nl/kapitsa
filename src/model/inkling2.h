@@ -77,6 +77,8 @@ struct Ink2Layer {
   const Tensor *router_w = nullptr, *router_bias = nullptr;
   const Tensor *w13 = nullptr, *w13_sc = nullptr, *w2 = nullptr, *w2_sc = nullptr;
   Buffer w13_outer, w2_outer;  // FP32 [128] = amax[e] / outer_scale_denominator[0] (NVFP4 only)
+  Buffer qkvrsg_w;             // Fused BF16 [wq_du; wr_du; attn_sink_proj; gate_attn; wk_dv; wv_dv]
+  uint32_t qkvrsg_offs[7] = {};
 };
 
 class Inkling2 : public Model {
@@ -96,6 +98,9 @@ class Inkling2 : public Model {
   const std::vector<int>& eos_ids() const override { return cfg_.eos; }
   int prefill_chunk() const override { return tmax_; }
   bool can_snapshot() const override { return false; }
+  bool grouped_passes() const override { return true; }
+  bool use_tensor() const { return use_tensor_; }
+  void set_use_tensor(bool on);
 
   void set_mem_budget(size_t bytes) override { mem_budget_ = bytes; }
   std::unique_ptr<Seq> new_seq(int limit, int initial = -1) override;
@@ -116,6 +121,7 @@ class Inkling2 : public Model {
   Buffer logits_buf() const { return logits_; }
   void encode_logits_rows(Encoder& e, Seq& s, int pos0, int T, const Buffer& out);
   void encode_prefill_diag(Encoder& e, Seq& s, int pos0, int T, const Buffer& diag_rows);
+  int debug_tensor_unit_check();
 
  private:
   void load();
@@ -127,8 +133,12 @@ class Inkling2 : public Model {
               bool exact_f32 = false);
   void enc_norm(Encoder& e, const Buffer& x, const Tensor* w, const Buffer& out, int T, uint32_t dim);
   void enc_attn_res(Encoder& e, const Buffer* const* states, int M, const void* query_ptr, bool q_f32, uint32_t Q,
-                    const Buffer& out, int T);
-  void enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, const Buffer& m, const Buffer& out, int T);
+                    const Buffer& out, int T, uint32_t norm_mask = 0);
+  void enc_msg_gate(Encoder& e, const Ink2Ctrl& c, const Buffer& h, const Buffer& m, const Buffer& out, int T,
+                    int slot = 0);
+  void enc_msg_gate3(Encoder& e, const Ink2Ctrl& c0, const Ink2Ctrl& c1, const Ink2Ctrl& c2, const Buffer& h0,
+                     const Buffer& h1, const Buffer& h2, const Buffer& m0, const Buffer& m1, const Buffer& m2,
+                     const Buffer& o0, const Buffer& o1, const Buffer& o2, int T);
   void enc_sample(Encoder& e, Seq& s, const Buffer& lrow, const Buffer& tokens, int out_index, const SamplingParams& sp,
                   uint32_t step);
 
@@ -145,6 +155,7 @@ class Inkling2 : public Model {
 
   int tmax_ = 512;
   int ring_rows_ = 0;
+  bool use_tensor_ = false;
   size_t mem_budget_ = 0;
 
   // Reusable activations sized for `tmax_` rows
@@ -152,11 +163,13 @@ class Inkling2 : public Model {
   Buffer blocks_[6];        // block boundary states + bank state during middle cycle
   Buffer prelude_blocks_[4];
   Buffer ar_out_;           // attn_res output: up to 4 * tmax * H
-  Buffer mg0_, mg1_, mg2_;  // saved cross-pass messages across attn_queries
+  Buffer msg_out_;          // cross-pass messages: 4 * tmax * H
+  Buffer mg_cat_, mg_lat_, mg_f_, mg_g_;  // split/batched MessageGate buffers
   Buffer n0_, n1_, n2_;     // normed inputs [tmax, H]
   Buffer q_, k_, v_, r_, sinks_, gate_attn_, att_out_, a_out_;
   Buffer dyn_, rb_, part_m_, part_l_, part_o_;
   Buffer h_mlp_, x_mlp_, rlog_, eid_, ew_, moe_act_, moe_out_;
+  Buffer moe_tiles_, moe_ntiles_, moe_st_tok_, moe_st_pair_, moe_st_ew_, moe_pair_out_;
   Buffer logits_, cand_v_, cand_i_, sprob_, samp_;
 };
 

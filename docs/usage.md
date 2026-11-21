@@ -310,9 +310,12 @@ pre-tokenizer (`pretokenize_o200k`), and final logit softcap 30. Its template fo
 renders tool schemas as JSON under `<|message_system|>tool_declare<|content_xml|>`, streams `<|content_thinking|>` as
 reasoning and `<|content_invoke_tool_json|>` as tool calls, and supports `--suppress-tokens` (`NI_SUPPRESS_TOKENS`); it
 decodes plainly, and `build/ink2_check DIR` checks logits and 24-token greedy rollouts against `tests/fixtures/ink2_golden.json`.
-Prefill chunks above 32 rows run FP16-input tiled GEMMs (`ink2_bf16_mm`, FP32 accumulation) on `wq`, `wk`, `wv`, `wr`,
-`wo`, `gate_attn`, the attention sink projection, and the dynamic short-conv projections, while the MoE router and all
-decode / small-chunk (`<= 32` rows) GEMMs stay exact FP32 (`ink2_bf16_mv`).
+Prefill chunks above 32 rows run half-input tiled GEMMs (FP32 accumulation) on `wq`, `wk`, `wv`, `wr`, `wo`,
+`gate_attn`, the attention sink projection, the dynamic short-conv projections, and any unembed call with `rows_out > 32`
+(which single-token decode and prompt prefill's last-row logits never hit, though all-row logit passes can), routed to
+`ink2_bf16_mm_t` on Metal 4 tensor ops (`NI_INK2_TENSOR`, default on for Apple10+ / macOS 26+) or `ink2_bf16_mm` on Metal
+3; the MoE router and all decode / small-chunk (`<= 32` rows) GEMMs stay exact FP32 (`ink2_bf16_mv4`, `ink2_bf16_mv8`,
+`ink2_bf16_mv`).
 
 Refused, with a message: other architectures, other quantizations (MLX's `mxfp4`, `nvfp4` and `mxfp8` modes among
 them; NVIDIA's own NVFP4 checkpoints of the catalog's Nemotron models are read as they are), mixture-of-experts
@@ -1494,6 +1497,7 @@ KFlash's knobs are `NI_KFLASH_<NAME>`; each was `NI_DFLASH_<NAME>` before #362 a
 | `NI_DORY_SPEC` | `both` | Dory with `--loop-kv per-loop`: the drafts of speculative decoding, `both` (prompt lookup, else the model itself at one loop), `ngram` (prompt lookup only) or `self`; `--spec 0` decodes plainly. |
 | `NI_KFLASH_V8` | Auto | `1` uses the target eight-row projection kernels in the drafter, `0` the earlier path. Auto includes hidden size 2048 on the 32-core M1 Max with an MoE target and native 4-bit head, in addition to hidden sizes at least 2560. This does not change speculation depth. |
 | `NI_DFL_NT` | new rule | The DFlash2 drafter's matrix-unit GEMMs take 16 weight rows a simdgroup unless the grid would pass 8,192 threadgroups or the output is narrow (N <= 4,096) with K above 4,096, where they take 32; `0` restores the previous rule (32 for every K above 4,096). The 27B's 16-row drafting pass 4.41 -> 3.96 ms on the M5 Max (ni_run, interleaved runs, the same tokens); its 8-row block with `NI_KFLASH_V8=0` 3.14 -> 3.07; the 35B's drafter is unchanged. |
+| `NI_INK2_TENSOR` | on, on an M5-class GPU with macOS 26 | Inkling-2-Mini: prefill GEMMs (`M > 32`, `ink2_bf16_mm_t`), grouped MoE (`ink2_moe_nvfp4_{w13,w2}_t`, `ink2_moe_mxfp8_{w13,w2}_t`), attention (`ink2_attn_prefill_t`), and batched MessageGate helpers on Metal 4 tensor ops (`src/kernels/inkling2_tensor/ink2_tensor.metal`), taking half-precision matrix operands (rows over 32) with FP32 accumulation instead of `ink2_bf16_mm`'s simdgroup path (rows up to 32 and the MoE router stay exact FP32; decode unchanged). `0` falls back cleanly to Metal 3, which any GPU before Apple10, macOS before 26, or failed Metal 4 tensor library compilation does anyway. |
 | `NI_PREWARM` | on | `0` creates the GPU pipelines on first use instead of at load. |
 
 The other `NI_*` switches exist for development and A/B tests.

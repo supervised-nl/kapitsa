@@ -162,6 +162,12 @@ const DefaultRow kDefaults[] = {
     // unchanged; 1,024 rows against precise: 86 top-1 flips, mean KL 0.137, inside its bar (MLX on the same pack).
     {"a4_qtm_fast", Knob::kA4QtmFast, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 56, 58, false,
      "M5 Max; fast profile only", true},
+    // Inkling-2-Mini Metal 4 tensor_ops prefill (src/kernels/inkling2_tensor/ink2_tensor.metal, NI_INK2_TENSOR):
+    // requires Apple10+ matrix units and macOS 26+. M5 Max (40-core, macOS 27.3), interleaved A/B vs NI_INK2_TENSOR=0:
+    // ~584-4090t prefill 247-330 -> 1820-2154 tok/s (+479% to +689%); overall vs origin/main +801% to +1118% prefill,
+    // +43% to +63% decode.
+    {"ink2_tensor", Knob::kInk2Tensor, ModelClass::kOther, DefaultScope::kMatrix, nullptr, "on", 480, 689, false,
+     "M5 Max; matrix class", true},
 };
 
 bool guard_matches(const char* id, const DeviceProfile& dev) {

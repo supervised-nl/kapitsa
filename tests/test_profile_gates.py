@@ -173,6 +173,7 @@ CLASS_GATE_IDS = (
     "moe4_dx",
     "tree_g6",
     "kflash_narrow",
+    "ink2_tensor",
 )
 
 # A name predicate the call sites still read. Each id must be a kGuard row, not a kName row:

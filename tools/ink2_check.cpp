@@ -154,5 +154,10 @@ int main(int argc, char** argv) {
       }
     }
   }
+  if (model.use_tensor()) {
+    printf("RUN T96_tensor_ab:\n");
+    fails += model.debug_tensor_unit_check();
+  }
+  if (ni::Encoder::profiling()) ni::Encoder::profile_report(1);
   return fails ? 1 : 0;
 }
