@@ -1,36 +1,39 @@
 {
   "model": "Inkling-2-Mini",
   "measured": {
-    "build": "0.2.39 (7c03db7)",
+    "build": "0.2.39 (8e16bff)",
     "mac": "MacBook Pro (16-inch, 2026), M5 Max (40-core GPU), 128 GB",
-    "macos": "27.0",
-    "date": "2026-11-21T05:15:56Z",
+    "macos": "27.3",
+    "date": "2026-11-21T09:54:50Z",
     "records": 192,
     "source": "bench/corpus.txt",
     "env": {},
-    "command": "tools/logit_floor.py ~/models/Inkling-2-Mini"
+    "command": "tools/logit_floor.py /Volumes/w/models/Inkling-2-Mini --also NI_INK2_TENSOR=0 --reorder",
+    "also": ["NI_INK2_TENSOR=0"]
   },
   "reference_path": "step",
   "sources": {
     "repeat": {"paths": {"prefill": {"records": 8, "bitwise": 8, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0}, "step": {"records": 192, "bitwise": 192, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0}}, "what": "the same build and command run twice", "in_floor": true, "decode": true},
-    "chunk": {"records": 192, "bitwise": 192, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0, "what": "prefill chunks of 512 rows against 2048", "in_floor": true, "decode": false}
+    "chunk": {"records": 192, "bitwise": 96, "top1": 1.0, "flips": 0, "kl_mean": 0.0006645367685980044, "kl_median": 3.6039906008477326e-10, "kl_p99": 0.012047319219868348, "kl_max": 0.02877572671831877, "margin_change_max": 0.7962818145751953, "tie_margin": 0.1912250518798828, "nll_change_mean": -0.0006579602569165844, "max_abs_diff": 4.870754718780518, "what": "prefill chunks of 512 rows against 2048", "in_floor": true, "decode": false},
+    "repeat NI_INK2_TENSOR=0": {"paths": {"prefill": {"records": 8, "bitwise": 8, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0}, "step": {"records": 192, "bitwise": 192, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0}}, "what": "the same build and command run twice, with NI_INK2_TENSOR=0", "in_floor": true, "decode": true},
+    "chunk NI_INK2_TENSOR=0": {"records": 192, "bitwise": 192, "top1": 1.0, "flips": 0, "kl_mean": 0.0, "kl_median": 0.0, "kl_p99": 0.0, "kl_max": 0.0, "margin_change_max": 0.0, "tie_margin": 0.0, "nll_change_mean": 0.0, "max_abs_diff": 0.0, "what": "prefill chunks of 512 rows against 2048, with NI_INK2_TENSOR=0", "in_floor": true, "decode": false}
   },
   "floor": {
     "flips": 0,
-    "kl_mean": 0.0,
-    "kl_p99": 0.0,
-    "kl_max": 0.0,
-    "margin_change_max": 0.0,
-    "tie_margin": 0.0,
+    "kl_mean": 0.0006645367685980044,
+    "kl_p99": 0.012047319219868348,
+    "kl_max": 0.02877572671831877,
+    "margin_change_max": 0.7962818145751953,
+    "tie_margin": 0.1912250518798828,
     "records": 192,
     "top1": 1.0,
-    "set_by": {}
+    "set_by": {"kl_mean": "chunk", "kl_p99": "chunk", "kl_max": "chunk", "margin_change_max": "chunk", "tie_margin": "chunk"}
   },
   "gate": {
     "min_top1": 0.989583,
-    "max_mean_kl": 0.0,
-    "max_p99_kl": 0.0,
-    "near_tie": 0.0,
+    "max_mean_kl": 0.00133,
+    "max_p99_kl": 0.0241,
+    "near_tie": 0.192,
     "max_far_flips": 0
   },
   "decode_floor": {
@@ -50,5 +53,29 @@
     "max_p99_kl": 0.0,
     "near_tie": 0.0,
     "max_far_flips": 0
+  },
+  "reorder_sources": {
+    "NI_INK2_TENSOR=0": {"what": "the default against NI_INK2_TENSOR=0", "paths": {"prefill": {"records": 8, "bitwise": 0, "top1": 1.0, "flips": 0, "kl_mean": 0.0007824265926335546, "kl_median": 0.00012041130023519369, "kl_p99": 0.0026473012368241813, "kl_max": 0.0027231957295528464, "margin_change_max": 0.20996475219726562, "tie_margin": 0.0, "nll_change_mean": 0.000669236624071211, "max_abs_diff": 1.988416075706482}, "step": {"records": 192, "bitwise": 0, "top1": 1.0, "flips": 0, "kl_mean": 0.0012014762575514454, "kl_median": 8.23526299300126e-05, "kl_p99": 0.015232363420976775, "kl_max": 0.04544036301363895, "margin_change_max": 1.4569282531738281, "tie_margin": 1.1590070724487305, "nll_change_mean": -0.0029750588916701523, "max_abs_diff": 6.1184868812561035}}},
+    "NI_INK2_TENSOR=0 NI_MATH_SAFE=1": {"what": "the default against NI_INK2_TENSOR=0, both with NI_MATH_SAFE=1 (no fast math)", "paths": {"prefill": {"records": 8, "bitwise": 0, "top1": 1.0, "flips": 0, "kl_mean": 0.0008278411679668449, "kl_median": 0.0001948910471722842, "kl_p99": 0.00371210009602552, "kl_max": 0.003856277559921283, "margin_change_max": 0.2574329376220703, "tie_margin": 0.0, "nll_change_mean": -0.013598041981572568, "max_abs_diff": 1.7611537724733353}, "step": {"records": 192, "bitwise": 0, "top1": 1.0, "flips": 0, "kl_mean": 0.0011885934990765322, "kl_median": 8.847597945266282e-05, "kl_p99": 0.019837896336519494, "kl_max": 0.03996133690133289, "margin_change_max": 1.8910083770751953, "tie_margin": 0.10025978088378906, "nll_change_mean": 0.00010921127903309362, "max_abs_diff": 5.964533090591431}}}
+  },
+  "reorder_floor": {
+    "flips": 0,
+    "kl_mean": 0.0012014762575514454,
+    "kl_p99": 0.019837896336519494,
+    "kl_max": 0.04544036301363895,
+    "margin_change_max": 1.8910083770751953,
+    "tie_margin": 1.1590070724487305,
+    "records": 192,
+    "kl_median": 8.847597945266282e-05,
+    "top1": 1.0
+  },
+  "reorder_gate": {
+    "min_top1": 0.989583,
+    "max_mean_kl": 0.00241,
+    "max_p99_kl": 0.0397,
+    "near_tie": 1.16,
+    "max_far_flips": 0,
+    "max_median_kl": 0.000177,
+    "max_nll_change": 0.0272
   }
 }
