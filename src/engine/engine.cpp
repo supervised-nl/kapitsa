@@ -4268,7 +4268,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
 
     int P = n;
     bool go = handle(s.tokens()[n]);
-    int cur_d = ink2_spec_auto_ ? std::min(4, ink2_spec_) : ink2_spec_;
+    int cur_d = ink2_spec_auto_ ? std::min(2, ink2_spec_) : ink2_spec_;
     int pending_commit = 0, pending_pos = 0, pending_stride = 0, pending_rb = -1;
     while (go) {
       if (P + cur_d + 2 >= s.cap) {
@@ -4345,8 +4345,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
       P += m;
       if (ink2_spec_auto_) {
         if (a == d) cur_d = std::min(ink2_spec_, cur_d + 2);
-        else if (a >= cur_d - 1) cur_d = std::min(ink2_spec_, cur_d + 1);
-        else cur_d = std::clamp(a + 2, 2, ink2_spec_);
+        else cur_d = std::clamp(a + 1, 2, ink2_spec_);
       }
       if (go && contended()) yield_turn(res);
     }

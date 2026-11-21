@@ -1,8 +1,10 @@
 #include "model/inkling2.h"
 
 #include "engine/device_profile.h"
+#include "engine/profile.h"
 #include "model/inkling2_kernels.h"
 #include "model/kparams.h"
+#include "model/nemotron_h.h"
 #include "model/sampler.h"
 #include "util/bf16.h"
 #include "util/json_file.h"
@@ -20,6 +22,7 @@
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 namespace ni {
@@ -499,7 +502,76 @@ Inkling2::~Inkling2() {
 
 void Inkling2::load() {
   const double t0 = now_ms();
-  ws_.open_dir(path_, [](const std::string& n) { return n.rfind("model.llm.", 0) == 0; });
+  q8_dense_ = profile_switch("NI_INK2_Q8", true, "Inkling-2 load-time Q8_0 packing for BF16 dense projections & unembed");
+  auto is_q8_target = [&](const std::string& n) -> bool {
+    if (!q8_dense_) return false;
+    if (n == "model.llm.unembed.weight") return true;
+    static const char* const kSuf[] = {".attn.wq_du.weight", ".attn.wk_dv.weight", ".attn.wv_dv.weight",
+                                       ".attn.wr_du.weight", ".attn.gate_attn.weight", ".attn.wo_ud.weight"};
+    for (const char* s : kSuf) {
+      const size_t sl = std::strlen(s);
+      if (n.size() >= sl && n.compare(n.size() - sl, sl, s) == 0) return true;
+    }
+    return false;
+  };
+  ws_.open_dir(
+      path_, [](const std::string& n) { return n.rfind("model.llm.", 0) == 0; }, nullptr,
+      q8_dense_ ? WeightStore::Filter(is_q8_target) : WeightStore::Filter(nullptr));
+  const unsigned nthr = std::max(1u, std::min(12u, std::thread::hardware_concurrency()));
+  size_t q8_bytes = 0;
+  auto req_mat = [&](const std::string& name, int64_t N_min, int64_t K_want, bool exact_N) -> Ink2Mat {
+    const Tensor* t = ws_.find(name);
+    if (!t) fatal("%s: missing tensor %s", path_.c_str(), name.c_str());
+    if ((t->dtype != DType::BF16 && t->dtype != DType::F32) || t->shape.size() != 2 || t->shape[1] != K_want ||
+        (exact_N ? (t->shape[0] != N_min) : (t->shape[0] < N_min)))
+      fatal("%s: %s has unexpected dtype/shape", path_.c_str(), name.c_str());
+    Ink2Mat m;
+    m.N = uint32_t(N_min);
+    m.K = uint32_t(K_want);
+    if (!ws_.deferred(name)) {
+      m.raw = t;
+      return m;
+    }
+    const size_t full_bytes = size_t(t->numel()) * dtype_size(t->dtype);
+    std::vector<uint8_t> host_raw(full_bytes);
+    ws_.read_deferred(name, host_raw.data());
+    const size_t N = size_t(N_min);
+    const size_t K = size_t(K_want);
+    const size_t qsz = N * K;
+    const size_t ssz = N * (K / 32) * 2;
+    Gpu& g = Gpu::get();
+    m.q = g.alloc(qsz, "ink2_q8_q");
+    m.s = g.alloc(ssz, "ink2_q8_s");
+    owned_bufs_.push_back(m.q);
+    owned_bufs_.push_back(m.s);
+    q8_bytes += qsz + ssz;
+    uint8_t* qdst = m.q.as<uint8_t>();
+    uint8_t* sdst = m.s.as<uint8_t>();
+    const bool is_f32 = t->dtype == DType::F32;
+    const size_t srow = (K / 32) * 2;
+    auto worker = [&](size_t r0, size_t r1) {
+      std::vector<float> frow(K);
+      for (size_t r = r0; r < r1; ++r) {
+        if (is_f32) {
+          const float* sr = reinterpret_cast<const float*>(host_raw.data()) + r * K;
+          nh_quant_q8(sr, int64_t(K), qdst + r * K, sdst + r * srow);
+        } else {
+          const uint16_t* sr = reinterpret_cast<const uint16_t*>(host_raw.data()) + r * K;
+          for (size_t c = 0; c < K; ++c) frow[c] = bf16_to_f32(sr[c]);
+          nh_quant_q8(frow.data(), int64_t(K), qdst + r * K, sdst + r * srow);
+        }
+      }
+    };
+    const size_t use_thr = std::min<size_t>(nthr, std::max<size_t>(1, N / 64));
+    if (use_thr <= 1) {
+      worker(0, N);
+    } else {
+      std::vector<std::thread> ts;
+      for (size_t ti = 0; ti < use_thr; ++ti) ts.emplace_back(worker, N * ti / use_thr, N * (ti + 1) / use_thr);
+      for (auto& th : ts) th.join();
+    }
+    return m;
+  };
   auto req_shape = [&](const std::string& name, std::initializer_list<int64_t> want) -> const Tensor* {
     const Tensor* t = ws_.find(name);
     if (!t) fatal("%s: missing tensor %s", path_.c_str(), name.c_str());
@@ -536,10 +608,7 @@ void Inkling2::load() {
     fatal("%s: model.llm.embed.weight must be BF16 [>=%d, %lld]", path_.c_str(), cfg_.vocab, (long long)H64);
   embed_norm_ = req_raw("model.llm.embed_norm.weight", DType::BF16, {H64});
   final_norm_ = req_float("model.llm.norm.weight", {H64});
-  unembed_ = req_any("model.llm.unembed.weight");
-  if ((unembed_->dtype != DType::BF16 && unembed_->dtype != DType::F32) || unembed_->shape.size() != 2 ||
-      unembed_->shape[0] < cfg_.vocab || unembed_->shape[1] != H64)
-    fatal("%s: model.llm.unembed.weight must be BF16/F32 [>=%d, %lld]", path_.c_str(), cfg_.vocab, (long long)H64);
+  unembed_ = req_mat("model.llm.unembed.weight", cfg_.vocab, H64, false);
 
   attn_queries_.resize(size_t(cfg_.num_layers - 1));
   for (int i = 0; i < cfg_.num_layers - 1; ++i) {
@@ -591,13 +660,13 @@ void Inkling2::load() {
     const std::string p = "model.llm.layers." + std::to_string(i) + ".";
     L.is_swa = cfg_.is_local[size_t(i)];
     L.has_ctrl = (i >= cfg_.core_start && i < cfg_.core_end);
-    L.wq_du = req_float(p + "attn.wq_du.weight", {QD64, H64});
-    L.wk_dv = req_float(p + "attn.wk_dv.weight", {KVD64, H64});
-    L.wv_dv = req_float(p + "attn.wv_dv.weight", {KVD64, H64});
-    L.wr_du = req_float(p + "attn.wr_du.weight", {int64_t(cfg_.hq) * cfg_.d_rel, H64});
+    L.wq_du = req_mat(p + "attn.wq_du.weight", QD64, H64, true);
+    L.wk_dv = req_mat(p + "attn.wk_dv.weight", KVD64, H64, true);
+    L.wv_dv = req_mat(p + "attn.wv_dv.weight", KVD64, H64, true);
+    L.wr_du = req_mat(p + "attn.wr_du.weight", int64_t(cfg_.hq) * cfg_.d_rel, H64, true);
     L.attn_sink_proj = req_float(p + "attn.attn_sink_proj.weight", {cfg_.hq, H64});
-    L.gate_attn = req_float(p + "attn.gate_attn.weight", {QD64, H64});
-    L.wo_ud = req_float(p + "attn.wo_ud.weight", {H64, QD64});
+    L.gate_attn = req_mat(p + "attn.gate_attn.weight", QD64, H64, true);
+    L.wo_ud = req_mat(p + "attn.wo_ud.weight", H64, QD64, true);
     L.q_scale = req_float(p + "attn.q_l2_clip.scale", {cfg_.hq, cfg_.head_dim});
     L.rel_scale = req_float(p + "attn.rel_l2_clip.scale", {cfg_.hq, cfg_.d_rel});
     if (L.q_scale->dtype != L.rel_scale->dtype)
@@ -657,13 +726,13 @@ void Inkling2::load() {
     }
   }
 
-  // Pack [wq_du; wr_du; attn_sink_proj; gate_attn; wk_dv; wv_dv] per layer for fused MV dispatches.
-  {
+  // Pack [wq_du; wr_du; attn_sink_proj; gate_attn; wk_dv; wv_dv] per layer for fused BF16 MV dispatches (when not Q8).
+  if (!q8_dense_) {
     const bool allow_pack = !mem_budget_ || (ws_.total_bytes() + 1050ull * 1024ull * 1024ull <= mem_budget_);
     if (allow_pack) {
       for (int i = 0; i < cfg_.num_layers; ++i) {
         Ink2Layer& L = layers_[size_t(i)];
-        const Tensor* segs[6] = {L.wq_du, L.wr_du, L.attn_sink_proj, L.gate_attn, L.wk_dv, L.wv_dv};
+        const Tensor* segs[6] = {L.wq_du.raw, L.wr_du.raw, L.attn_sink_proj, L.gate_attn.raw, L.wk_dv.raw, L.wv_dv.raw};
         bool ok = (cfg_.hidden & 7) == 0;
         uint32_t off = 0;
         L.qkvrsg_offs[0] = 0;
@@ -689,8 +758,8 @@ void Inkling2::load() {
   Gpu::get().make_resident(ws_.buffers());
   alloc_buffers();
   Gpu::get().make_resident(owned_bufs_);
-  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d), %.2f GB text weights in %.0f ms",
-       path_.c_str(), cfg_.vocab, ws_.total_bytes() / 1e9, now_ms() - t0);
+  logi("loaded %s: Inkling-2-Mini (24 layers / 48 visits, vocab %d%s), %.2f GB text weights in %.0f ms",
+       path_.c_str(), cfg_.vocab, q8_dense_ ? ", Q8 dense" : "", (ws_.total_bytes() + q8_bytes) / 1e9, now_ms() - t0);
 }
 
 void Inkling2::alloc_buffers() {
@@ -985,6 +1054,42 @@ void Inkling2::enc_mm(Encoder& e, const Tensor& w, const Buffer& x, const Buffer
     e.buf(1, w.buf);
     e.buf(2, y);
     e.val(3, p);
+    e.dispatch((N + 63) / 64, (uint32_t(M) + 31) / 32, 1, 128);
+  }
+}
+
+void Inkling2::enc_mm(Encoder& e, const Ink2Mat& w, const Buffer& x, const Buffer& y, int M, uint32_t N_limit,
+                      bool add, bool exact_f32) {
+  if (!w.is_q8()) {
+    enc_mm(e, *w.raw, x, y, M, N_limit, add, exact_f32);
+    return;
+  }
+  const uint32_t N = N_limit ? N_limit : w.N;
+  const uint32_t K = w.K;
+  const Ink2MmP p{uint32_t(M), N, K, K, N, 0u, add ? 1u : 0u};
+  if (M == 1) {
+    e.use(ink2_pipe("ink2_q8_mv1"));
+    e.buf(0, x);
+    e.buf(1, w.q);
+    e.buf(2, w.s);
+    e.buf(3, y);
+    e.val(4, p);
+    e.dispatch((N + 7) / 8, 1, 1, 128);
+  } else if (M <= 16 || exact_f32) {
+    e.use(ink2_pipe("ink2_q8_mv"));
+    e.buf(0, x);
+    e.buf(1, w.q);
+    e.buf(2, w.s);
+    e.buf(3, y);
+    e.val(4, p);
+    e.dispatch((N + 3) / 4, (uint32_t(M) + 7) / 8, 1, 128);
+  } else {
+    e.use(ink2_pipe("ink2_q8_mm"));
+    e.buf(0, x);
+    e.buf(1, w.q);
+    e.buf(2, w.s);
+    e.buf(3, y);
+    e.val(4, p);
     e.dispatch((N + 63) / 64, (uint32_t(M) + 31) / 32, 1, 128);
   }
 }
@@ -1320,18 +1425,18 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.val(8, mp);
       e.dispatch((mp.N_tot + 15) / 16, 1, 1, 128);
       if (nsegs == 4u) {
-        enc_mm(e, *L.wk_dv, kn, k_, T);
-        enc_mm(e, *L.wv_dv, vn, v_, T);
+        enc_mm(e, L.wk_dv, kn, k_, T);
+        enc_mm(e, L.wv_dv, vn, v_, T);
         e.group_end();
       }
     } else {
       e.group_begin();
-      enc_mm(e, *L.wq_du, n0_, q_, T);
-      enc_mm(e, *L.wk_dv, kn, pf_sconv_kv ? moe_out_ : k_, T);
-      enc_mm(e, *L.wv_dv, vn, pf_sconv_kv ? h_mlp_ : v_, T);
-      enc_mm(e, *L.wr_du, n0_, r_, T);
+      enc_mm(e, L.wq_du, n0_, q_, T);
+      enc_mm(e, L.wk_dv, kn, pf_sconv_kv ? moe_out_ : k_, T);
+      enc_mm(e, L.wv_dv, vn, pf_sconv_kv ? h_mlp_ : v_, T);
+      enc_mm(e, L.wr_du, n0_, r_, T);
       enc_mm(e, *L.attn_sink_proj, n0_, sinks_, T);
-      enc_mm(e, *L.gate_attn, n0_, gate_attn_, T);
+      enc_mm(e, L.gate_attn, n0_, gate_attn_, T);
       e.group_end();
     }
 
@@ -1553,7 +1658,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
     }
 
     // wo_ud + attn_sconv -> a_out_ (or fused + *cur_x -> ffn_inp_ on non-boundary layers)
-    enc_mm(e, *L.wo_ud, att_out_, a_out_, T);
+    enc_mm(e, L.wo_ud, att_out_, a_out_, T);
     const bool is_boundary = (ip % cfg_.block_sz == 0);
     const Buffer* ffn_ptr = nullptr;
     if (T >= 16) {
@@ -1803,7 +1908,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
   const Buffer& dst = out_logits ? *out_logits : logits_;
   const int rows_out = need_all_logits ? T : 1;
   const Buffer h_in = need_all_logits ? h_norm_ : h_norm_.view(size_t(T - 1) * H * 4, size_t(H) * 4);
-  enc_mm(e, *unembed_, h_in, dst, rows_out, V, false);
+  enc_mm(e, unembed_, h_in, dst, rows_out, V, false);
   {
     const Ink2SoftcapP sp{uint32_t(rows_out) * V, cfg_.logit_softcap, 1.0f / cfg_.logit_softcap};
     e.use(ink2_pipe("ink2_softcap"));
@@ -1895,7 +2000,7 @@ void Inkling2::encode_conv_rollback(Encoder& e, Seq& s, int keep_idx, int total_
 }
 
 void Inkling2::enc_unembed(Encoder& e, const Buffer& h, const Buffer& out_logits, int rows) {
-  enc_mm(e, *unembed_, h, out_logits, rows, uint32_t(cfg_.vocab), false);
+  enc_mm(e, unembed_, h, out_logits, rows, uint32_t(cfg_.vocab), false);
 }
 
 void Inkling2::encode_logits_rows(Encoder& e, Seq& s, int pos0, int T, const Buffer& out) {
@@ -1937,9 +2042,9 @@ int Inkling2::debug_tensor_unit_check() {
     return ok ? 0 : 1;
   };
 
-  // 1. BF16 GEMM (L0.wq_du: 3072 x 2304)
+  // 1. BF16 GEMM (L0.wq_du when BF16, else L0.router_w)
   {
-    const Tensor& w = *layers_[0].wq_du;
+    const Tensor& w = layers_[0].wq_du.raw ? *layers_[0].wq_du.raw : *layers_[0].router_w;
     const uint32_t N = uint32_t(w.shape[0]), K = uint32_t(w.shape[1]);
     for (uint32_t i = 0; i < T * K; ++i) x_mlp_.as<float>()[i] = 0.25f * std::sin(float(i) * 0.013f);
     std::vector<float> ref(size_t(T) * N), ten(size_t(T) * N);

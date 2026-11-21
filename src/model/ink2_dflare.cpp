@@ -251,13 +251,25 @@ void Ink2DFlare::load() {
 
     auto e = g.begin();
     struct { uint32_t V, H, R; } fp{V, uint32_t(H_), uint32_t(rank_)};
-    e->use(dfl_pipe("dflare_fold_mm_q8"));
-    e->buf(0, tg_.unembed_tensor().buf);
-    e->buf(1, hw.buf);
-    e->buf(2, fold_q_);
-    e->buf(3, fold_s_);
-    e->val(4, fp);
-    e->dispatch(uint32_t(rank_ / 32), (V + 31u) / 32u, 1, 128);
+    const Ink2Mat& um = tg_.unembed_mat();
+    if (um.is_q8()) {
+      e->use(dfl_pipe("dflare_fold_mm_q8_from_q8"));
+      e->buf(0, um.q);
+      e->buf(1, um.s);
+      e->buf(2, hw.buf);
+      e->buf(3, fold_q_);
+      e->buf(4, fold_s_);
+      e->val(5, fp);
+      e->dispatch(uint32_t(rank_ / 32), (V + 31u) / 32u, 1, 128);
+    } else {
+      e->use(dfl_pipe("dflare_fold_mm_q8"));
+      e->buf(0, um.raw->buf);
+      e->buf(1, hw.buf);
+      e->buf(2, fold_q_);
+      e->buf(3, fold_s_);
+      e->val(4, fp);
+      e->dispatch(uint32_t(rank_ / 32), (V + 31u) / 32u, 1, 128);
+    }
     tg_.enc_unembed(*e, hb, fold_b_, 1);
     e->commit_and_wait();
   }
