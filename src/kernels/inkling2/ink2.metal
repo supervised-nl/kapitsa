@@ -2038,3 +2038,112 @@ NI_INLINE float ink2_q8_dot16(uint4 v, const device float4* xp) {
     }
 }
 
+
+// ---- 14. Chunked multi-row verify attention (2 <= T <= 8, G = Hq/Hkv = 3): 24x less KV traffic at long context ----
+struct Ink2AttnVfP {
+  uint T, pos0, k_first, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa, chunk, nchunks;
+  float scale;
+};
+
+[[kernel]] void ink2_attn_verify_rows(const device float* q [[buffer(0)]], const device half* kc [[buffer(1)]],
+                                      const device half* vc [[buffer(2)]], const device float* rb [[buffer(3)]],
+                                      device float* pm [[buffer(4)]], device float* pl [[buffer(5)]],
+                                      device float* po [[buffer(6)]], constant Ink2AttnVfP& p [[buffer(7)]],
+                                      uint3 tg [[threadgroup_position_in_grid]],
+                                      uint sg [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float tgm[4], tgl[4], tgo[4][128];
+  const uint r = tg.x, h = tg.y, cid = tg.z;
+  const uint hkv = h / (p.Hq / p.Hkv);
+  const uint d0 = lane * 4u;
+  const uint qpos = p.pos0 + r;
+  const float4 qv = *(const device float4*)(q + (size_t(r) * p.Hq + h) * p.D + d0);
+  const device float* rbh = rb + (size_t(r) * p.Hq + h) * p.rel_extent;
+
+  const uint c0 = p.k_first + cid * p.chunk;
+  const uint c1 = min(qpos + 1u, c0 + p.chunk);
+  float mw = -INFINITY, lw = 0.0f;
+  float4 ow = float4(0.0f);
+  for (uint kp = c0 + sg; kp < c1; kp += 4u) {
+    const size_t koff = (size_t(kp) * p.Hkv + hkv) * p.D + d0;
+    const float4 kv = float4(*(const device half4*)(kc + koff));
+    float sc = simd_sum(dot(qv, kv)) * p.scale;
+    const uint dist = qpos - kp;
+    if (dist < p.rel_extent) sc += rbh[dist];
+    const float4 vv = float4(*(const device half4*)(vc + koff));
+    if (lw == 0.0f) {
+      mw = sc;
+      lw = 1.0f;
+      ow = vv;
+    } else {
+      const float nm = max(mw, sc);
+      const float e1 = metal::precise::exp(mw - nm), e2 = metal::precise::exp(sc - nm);
+      ow = ow * e1 + vv * e2;
+      lw = lw * e1 + e2;
+      mw = nm;
+    }
+  }
+  if (lane == 0u) {
+    tgm[sg] = mw;
+    tgl[sg] = lw;
+  }
+  *(threadgroup float4*)(&tgo[sg][d0]) = ow;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (sg == 0u) {
+    float mm = -INFINITY, ll = 0.0f;
+    float4 oo = float4(0.0f);
+    for (uint s = 0u; s < 4u; ++s) {
+      const float l2 = tgl[s];
+      if (l2 == 0.0f) continue;
+      const float m2 = tgm[s];
+      const float4 o2 = *(const threadgroup float4*)(&tgo[s][d0]);
+      if (ll == 0.0f) {
+        mm = m2;
+        ll = l2;
+        oo = o2;
+      } else {
+        const float nm = max(mm, m2);
+        const float e1 = metal::precise::exp(mm - nm), e2 = metal::precise::exp(m2 - nm);
+        oo = oo * e1 + o2 * e2;
+        ll = ll * e1 + l2 * e2;
+        mm = nm;
+      }
+    }
+    const size_t idx = (size_t(r) * p.Hq + h) * p.nchunks + cid;
+    if (lane == 0u) {
+      pm[idx] = mm;
+      pl[idx] = ll;
+    }
+    *(device float4*)(po + idx * p.D + d0) = oo;
+  }
+}
+
+[[kernel]] void ink2_attn_verify_reduce(const device float* pm [[buffer(0)]], const device float* pl [[buffer(1)]],
+                                        const device float* po [[buffer(2)]], const device float* sinks [[buffer(3)]],
+                                        const device float* gate [[buffer(4)]], device float* out [[buffer(5)]],
+                                        constant Ink2AttnVfP& p [[buffer(6)]],
+                                        uint2 tg [[threadgroup_position_in_grid]],
+                                        uint lane [[thread_index_in_simdgroup]]) {
+  const uint h = tg.x, r = tg.y;
+  const uint d0 = lane * 4u;
+  const size_t base = (size_t(r) * p.Hq + h) * p.nchunks;
+  float mm = sinks[size_t(r) * p.Hq + h], ll = 1.0f;
+  float4 oo = float4(0.0f);
+  for (uint c = 0u; c < p.nchunks; ++c) {
+    const float l2 = pl[base + c];
+    if (l2 == 0.0f) continue;
+    const float m2 = pm[base + c];
+    const float4 o2 = *(const device float4*)(po + (base + c) * p.D + d0);
+    const float nm = max(mm, m2);
+    const float e1 = metal::precise::exp(mm - nm), e2 = metal::precise::exp(m2 - nm);
+    oo = oo * e1 + o2 * e2;
+    ll = ll * e1 + l2 * e2;
+    mm = nm;
+  }
+  const size_t qoff = (size_t(r) * p.Hq + h) * p.D + d0;
+  const float4 g4 = *(const device float4*)(gate + qoff);
+  const float4 sig = float4(1.0f) / (float4(1.0f) + float4(metal::precise::exp(-g4.x), metal::precise::exp(-g4.y),
+                                                           metal::precise::exp(-g4.z), metal::precise::exp(-g4.w)));
+  *(device float4*)(out + qoff) = (oo / ll) * sig;
+}

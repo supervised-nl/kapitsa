@@ -811,9 +811,9 @@ void Inkling2::alloc_buffers() {
   a_out_ = alloc(T * H * 4, "ink2_a_out");
   dyn_ = alloc(T * 4 * size_t(cfg_.hkv) * 4, "ink2_dyn");
   rb_ = alloc(T * size_t(cfg_.hq) * size_t(cfg_.rel_extent) * 4, "ink2_rb");
-  part_m_ = alloc(size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_m");
-  part_l_ = alloc(size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_l");
-  part_o_ = alloc(size_t(cfg_.hq) * kMaxAttnChunks * size_t(cfg_.head_dim) * 4, "ink2_part_o");
+  part_m_ = alloc(8 * size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_m");
+  part_l_ = alloc(8 * size_t(cfg_.hq) * kMaxAttnChunks * 4, "ink2_part_l");
+  part_o_ = alloc(8 * size_t(cfg_.hq) * kMaxAttnChunks * size_t(cfg_.head_dim) * 4, "ink2_part_o");
   h_mlp_ = alloc(T * H * 4, "ink2_h_mlp");
   x_mlp_ = alloc(T * H * 4, "ink2_x_mlp");
   rlog_ = alloc(T * size_t(cfg_.n_experts) * 4, "ink2_rlog");
@@ -1642,6 +1642,49 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
       e.buf(6, att_out_);
       e.val(7, apf);
       e.dispatch((uint32_t(T) + 15) / 16, uint32_t(cfg_.hq), 1, 128);
+    } else if (T >= 2 && T <= 8 && !L.is_swa && pos0 >= 1024 &&
+               (!getenv("NI_INK2_VATTN") || atoi(getenv("NI_INK2_VATTN")) != 0)) {
+      struct Ink2AttnVfP {
+        uint32_t T, pos0, k_first, kv_cap, Hq, Hkv, D, rel_extent, is_swa, swa, chunk, nchunks;
+        float scale;
+      };
+      const uint32_t span = uint32_t(pos0 + T);
+      uint32_t chunk = std::max(64u, (span + kMaxAttnChunks - 1) / kMaxAttnChunks);
+      chunk = (chunk + 3) / 4 * 4;
+      const uint32_t nchunks = std::max(1u, (span + chunk - 1) / chunk);
+      const Ink2AttnVfP avp{uint32_t(T),
+                            uint32_t(pos0),
+                            0u,
+                            kv_cap,
+                            uint32_t(cfg_.hq),
+                            uint32_t(cfg_.hkv),
+                            uint32_t(cfg_.head_dim),
+                            uint32_t(cfg_.rel_extent),
+                            0u,
+                            uint32_t(cfg_.swa),
+                            chunk,
+                            nchunks,
+                            attn_scale};
+      e.use(ink2_pipe("ink2_attn_verify_rows"));
+      e.buf(0, q_);
+      e.buf(1, s.kc[v_idx]);
+      e.buf(2, s.vc[v_idx]);
+      e.buf(3, rb_);
+      e.buf(4, part_m_);
+      e.buf(5, part_l_);
+      e.buf(6, part_o_);
+      e.val(7, avp);
+      e.dispatch(uint32_t(T), uint32_t(cfg_.hq), nchunks, 128);
+
+      e.use(ink2_pipe("ink2_attn_verify_reduce"));
+      e.buf(0, part_m_);
+      e.buf(1, part_l_);
+      e.buf(2, part_o_);
+      e.buf(3, sinks_);
+      e.buf(4, gate_attn_);
+      e.buf(5, att_out_);
+      e.val(6, avp);
+      e.dispatch(uint32_t(cfg_.hq), uint32_t(T), 1, 32);
     } else {
       const Ink2AttnPfP apf{uint32_t(T),
                             uint32_t(pos0),
@@ -1928,7 +1971,7 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
 
 void Inkling2::enc_sample(Encoder& e, Seq& s, const Buffer& lrow, const Buffer& tokens, int out_index,
                           const SamplingParams& sp, uint32_t step) {
-  (void)s;
+  enc_logit_mask(e, s, lrow, 1, cfg_.vocab, cfg_.vocab);
   if (full_vocab(sp)) {
     enc_sample_full(e, lrow, uint32_t(cfg_.vocab), tokens, out_index, sprob_, sp, step);
     return;
