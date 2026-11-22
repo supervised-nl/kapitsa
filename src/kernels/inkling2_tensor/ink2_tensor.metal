@@ -786,3 +786,111 @@ NI_INLINE float ink2t_situ(float g, float u) {
     out[qoff] = (o_tile[r * D + col] * corr / denom) * sigmoid(g);
   }
 }
+// ---- Inkling-2-Mini Q8_0 dense prefill GEMM on Apple10+ matrix units (Metal 4 tensor_ops) ----
+//
+// Double-buffered 64x64x32 matmul2d tile (4 simdgroups, each 32x32x32) for Q8_0 weights [N, K] (signed int8,
+// block-32 half scale [N, K/32]) and float X [M, x_ld] -> float Y [M, y_ld] (optional add).
+// Threadgroup memory: 2 * (64*32 + 64*32) * 2 B = 16,384 B (within 32 KB even under shader validation's 2x count).
+
+struct Ink2Q8tP {  // = Ink2MmP
+  uint M, N, K, x_ld, y_ld, w_f32, add;
+};
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void ink2_t_q8_m64(
+    const device float* X [[buffer(0)]], const device uchar* Q [[buffer(1)]], const device half* S [[buffer(2)]],
+    device float* Y [[buffer(3)]], constant Ink2Q8tP& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  constexpr int BM = 64, BN = 64, BK = 32, SM = 32, SN = 32;
+  threadgroup half xs[2 * BM * BK];
+  threadgroup half ws[2 * BN * BK];
+
+  const uint m0 = tg.y * BM, n0 = tg.x * BN;
+  const uint sm = sg / 2u, sn = sg & 1u;
+  constexpr auto desc =
+      matmul2d_descriptor(SM, SN, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  typedef tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tg_t;
+  auto tX0 = tg_t(xs + sm * SM * BK, dextents<int32_t, 2>(BK, SM));
+  auto tW0 = tg_t(ws + sn * SN * BK, dextents<int32_t, 2>(BK, SN));
+  auto tX1 = tg_t(xs + BM * BK + sm * SM * BK, dextents<int32_t, 2>(BK, SM));
+  auto tW1 = tg_t(ws + BN * BK + sn * SN * BK, dextents<int32_t, 2>(BK, SN));
+  auto acc = op.template get_destination_cooperative_tensor<decltype(tX0), decltype(tW0), float>();
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+
+  // X loader: 64 * 32 / 8 = 256 half8 loads -> 2 loads per thread
+  uint xr[2], xk[2], xm[2];
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < 2; ++i) {
+    const uint j = tid + 128u * uint(i);
+    xr[i] = j / 4u;
+    xk[i] = (j & 3u) * 8u;
+    xm[i] = m0 + xr[i];
+  }
+
+  // W loader: 64 * 32 / 16 = 128 chunks of 16 int8s -> 1 uint4 + 1 half scale per thread
+  const uint wr = tid / 2u, wk = (tid & 1u) * 16u;
+  const uint wn = min(n0 + wr, p.N - 1u);
+  const uint blocks = p.K / 32u;
+  const size_t qrow = size_t(wn) * p.K;
+  const size_t srow = size_t(wn) * blocks;
+
+  half4 xh0[2], xh1[2];
+  uint4 wq = uint4(0);
+  half wsc = 0.0h;
+
+  auto load = [&](uint k0) {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 2; ++i) {
+      if (xm[i] < p.M) {
+        const device float* xp = X + size_t(xm[i]) * p.x_ld + k0 + xk[i];
+        xh0[i] = half4(*(const device float4*)(xp));
+        xh1[i] = half4(*(const device float4*)(xp + 4));
+      } else {
+        xh0[i] = half4(0.0h);
+        xh1[i] = half4(0.0h);
+      }
+    }
+    wq = *(const device uint4*)(Q + qrow + k0 + wk);
+    wsc = S[srow + (k0 >> 5)];
+  };
+
+  auto store = [&](uint b) {
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 2; ++i) {
+      threadgroup half* dst = xs + b * BM * BK + xr[i] * BK + xk[i];
+      *(threadgroup half4*)(dst) = xh0[i];
+      *(threadgroup half4*)(dst + 4) = xh1[i];
+    }
+    threadgroup half* wd = ws + b * BN * BK + wr * BK + wk;
+    const half4 sc4 = half4(wsc);
+    *(threadgroup half4*)(wd + 0) = half4(as_type<char4>(wq.x)) * sc4;
+    *(threadgroup half4*)(wd + 4) = half4(as_type<char4>(wq.y)) * sc4;
+    *(threadgroup half4*)(wd + 8) = half4(as_type<char4>(wq.z)) * sc4;
+    *(threadgroup half4*)(wd + 12) = half4(as_type<char4>(wq.w)) * sc4;
+  };
+
+  load(0);
+  store(0);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint steps = p.K / BK;
+  for (uint st = 0; st < steps; ++st) {
+    const bool more = st + 1 < steps;
+    if (more) load((st + 1) * BK);
+    if (st & 1) op.run(tX1, tW1, acc);
+    else op.run(tX0, tW0, acc);
+    if (more) store((st + 1) & 1);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  _Pragma("clang loop unroll(full)")
+  for (uint16_t i = 0; i < acc.get_capacity(); ++i) {
+    if (!acc.is_valid_element(i)) continue;
+    const auto ix = acc.get_multidimensional_index(i);
+    const uint n = n0 + sn * SN + ix[0], m = m0 + sm * SM + ix[1];
+    if (m >= p.M || n >= p.N) continue;
+    const size_t o = size_t(m) * p.y_ld + n;
+    if (p.add) Y[o] += acc[i];
+    else Y[o] = acc[i];
+  }
+}

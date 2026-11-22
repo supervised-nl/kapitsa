@@ -1083,6 +1083,14 @@ void Inkling2::enc_mm(Encoder& e, const Ink2Mat& w, const Buffer& x, const Buffe
     e.buf(3, y);
     e.val(4, p);
     e.dispatch((N + 3) / 4, (uint32_t(M) + 7) / 8, 1, 128);
+  } else if (use_tensor_ && M > 32 && K % 32 == 0 && (!getenv("NI_INK2_Q8_T") || atoi(getenv("NI_INK2_Q8_T")) != 0)) {
+    e.use(ink2_tpipe("ink2_t_q8_m64"));
+    e.buf(0, x);
+    e.buf(1, w.q);
+    e.buf(2, w.s);
+    e.buf(3, y);
+    e.val(4, p);
+    e.dispatch((N + 63) / 64, (uint32_t(M) + 63) / 64, 1, 128);
   } else {
     e.use(ink2_pipe("ink2_q8_mm"));
     e.buf(0, x);
