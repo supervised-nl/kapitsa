@@ -1649,8 +1649,11 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
         float scale;
       };
       const uint32_t span = uint32_t(pos0 + T);
+      static const bool vattn_t_env = !getenv("NI_INK2_VATTN_T") || atoi(getenv("NI_INK2_VATTN_T")) != 0;
+      static const bool vattn_t_small = getenv("MTL_SHADER_VALIDATION") && atoi(getenv("MTL_SHADER_VALIDATION")) != 0;
+      const bool use_vattn_t = vattn_t_env && use_tensor_ && cfg_.head_dim == 128 && cfg_.hq == cfg_.hkv * 3;
       uint32_t chunk = std::max(64u, (span + kMaxAttnChunks - 1) / kMaxAttnChunks);
-      chunk = (chunk + 3) / 4 * 4;
+      chunk = (chunk + 31) / 32 * 32;
       const uint32_t nchunks = std::max(1u, (span + chunk - 1) / chunk);
       const Ink2AttnVfP avp{uint32_t(T),
                             uint32_t(pos0),
@@ -1665,16 +1668,29 @@ void Inkling2::enc_forward(Encoder& e, Seq& s, int pos0, int T, bool dump_logits
                             chunk,
                             nchunks,
                             attn_scale};
-      e.use(ink2_pipe("ink2_attn_verify_rows"));
-      e.buf(0, q_);
-      e.buf(1, s.kc[v_idx]);
-      e.buf(2, s.vc[v_idx]);
-      e.buf(3, rb_);
-      e.buf(4, part_m_);
-      e.buf(5, part_l_);
-      e.buf(6, part_o_);
-      e.val(7, avp);
-      e.dispatch(uint32_t(T), uint32_t(cfg_.hq), nchunks, 128);
+      if (use_vattn_t) {
+        e.use(base_pipe(vattn_t_small ? "ink2_attn_t_rows_k16" : "ink2_attn_t_rows_k32"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, part_m_);
+        e.buf(5, part_l_);
+        e.buf(6, part_o_);
+        e.val(7, avp);
+        e.dispatch(nchunks, uint32_t(cfg_.hkv), 1, 96);
+      } else {
+        e.use(ink2_pipe("ink2_attn_verify_rows"));
+        e.buf(0, q_);
+        e.buf(1, s.kc[v_idx]);
+        e.buf(2, s.vc[v_idx]);
+        e.buf(3, rb_);
+        e.buf(4, part_m_);
+        e.buf(5, part_l_);
+        e.buf(6, part_o_);
+        e.val(7, avp);
+        e.dispatch(uint32_t(T), uint32_t(cfg_.hq), nchunks, 128);
+      }
 
       e.use(ink2_pipe("ink2_attn_verify_reduce"));
       e.buf(0, part_m_);
