@@ -4279,6 +4279,8 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
       }
       const int d = cur_d;
+      static const bool gpu_pkt_env = !getenv("NI_INK2_GPU_PKT") || atoi(getenv("NI_INK2_GPU_PKT")) != 0;
+      const bool use_gpu_pkt = greedy && gpu_pkt_env;
       {
         auto e2 = g.begin();
         if (pending_commit > 0) {
@@ -4289,13 +4291,18 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
         ink2_dfl_->encode_draft(*e2, s, *slot.ink2_dseq, P, d);
         ink2_->encode_verify(*e2, s, P, d + 1, ink2_vf_logits_, &ink2_vf_taps_, true);
+        if (use_gpu_pkt) ink2_dfl_->encode_greedy_verify_pkt(*e2, ink2_vf_logits_, s, P, d);
         e2->commit_and_wait();
       }
-      const float* vl = ink2_vf_logits_.as<float>();
       int* tk = s.tokens();
       int a = 0;
       int bonus = 0;
-      if (greedy) {
+      if (use_gpu_pkt) {
+        const int* pkt = ink2_dfl_->verify_pkt();
+        a = pkt[0];
+        bonus = pkt[1];
+      } else if (greedy) {
+        const float* vl = ink2_vf_logits_.as<float>();
         for (int k = 0; k < d; ++k) {
           int tgt = argmax_row(vl + size_t(k) * size_t(V));
           if (tgt == tk[P + 1 + k]) {
@@ -4307,6 +4314,7 @@ ChatResult Engine::chat(const ChatRequest& r_in, const std::function<bool(const 
         }
         if (a == d) bonus = argmax_row(vl + size_t(d) * size_t(V));
       } else {
+        const float* vl = ink2_vf_logits_.as<float>();
         for (int k = 0; k < d; ++k) {
           build_probs(vl + size_t(k) * size_t(V));
           int drf = tk[P + 1 + k];

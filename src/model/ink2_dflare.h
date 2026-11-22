@@ -42,6 +42,10 @@ class Ink2DFlare {
   // (the anchor token at `pos`) and the committed context ring `[pos - ctx_len .. pos - 1]`.
   void encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, int depth);
 
+  // Greedy GPU argmax + prefix-match over `depth + 1` verify logit rows -> 2-int packet [accepted, bonus_tok].
+  void encode_greedy_verify_pkt(Encoder& e, const Buffer& logits, const Seq& s, int pos, int depth);
+  const int* verify_pkt() const { return vf_pkt_.as<int>(); }
+
  private:
   struct Q8Mat {
     Buffer q, s;
@@ -79,6 +83,7 @@ class Ink2DFlare {
   Buffer bgate_, bup_, bact_, draft_h_;       // MLP + final hidden (B <= 8)
   Buffer base_logits_, pick_v_, pick_i_;
   Buffer mh_state_, mh_rnn_in_, mh_latent_;
+  Buffer vf_part_v_, vf_part_i_, vf_pkt_;
 };
 
 }  // namespace ni

@@ -306,6 +306,10 @@ void Ink2DFlare::alloc_buffers() {
   bup_ = alloc(B * size_t(I_) * 4, "dfl_bup");
   bact_ = alloc(B * size_t(I_) * 4, "dfl_bact");
   draft_h_ = alloc(size_t(kMaxDrafts) * size_t(H_) * 4, "dfl_draft_h");
+  const size_t vf_chunks = (V + 4095) / 4096;
+  vf_part_v_ = alloc(size_t(kMaxDrafts + 1) * vf_chunks * 4, "dfl_vf_part_v");
+  vf_part_i_ = alloc(size_t(kMaxDrafts + 1) * vf_chunks * 4, "dfl_vf_part_i");
+  vf_pkt_ = alloc(16, "dfl_vf_pkt");
 
   const size_t nchunks = (V + 1023) / 1024;
   base_logits_ = alloc(size_t(kMaxDrafts) * V * 4, "dfl_base_logits");
@@ -536,6 +540,30 @@ void Ink2DFlare::encode_draft(Encoder& e, Seq& s, Ink2DFlareSeq& ds, int pos, in
     e.val(3, fp);
     e.dispatch(1, 1, 1, 256);
   }
+}
+
+void Ink2DFlare::encode_greedy_verify_pkt(Encoder& e, const Buffer& logits, const Seq& s, int pos, int depth) {
+  struct DflVfArgmaxP {
+    uint32_t V, R, d, nchunks, tok_base;
+  };
+  const uint32_t V = uint32_t(tg_.vocab());
+  const uint32_t R = uint32_t(depth + 1);
+  const uint32_t nchunks = (V + 4095u) / 4096u;
+  const DflVfArgmaxP ap{V, R, uint32_t(depth), nchunks, uint32_t(pos + 1)};
+  e.use(dfl_pipe("dflare_vf_argmax_s1"));
+  e.buf(0, logits);
+  e.buf(1, vf_part_v_);
+  e.buf(2, vf_part_i_);
+  e.val(3, ap);
+  e.dispatch(nchunks, R, 1, 256);
+
+  e.use(dfl_pipe("dflare_vf_argmax_s2"));
+  e.buf(0, vf_part_v_);
+  e.buf(1, vf_part_i_);
+  e.buf(2, s.tok);
+  e.buf(3, vf_pkt_);
+  e.val(4, ap);
+  e.dispatch(1, 1, 1, 256);
 }
 
 }  // namespace ni

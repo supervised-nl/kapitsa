@@ -568,3 +568,92 @@ struct DflFoldPickP {
   }
   if (tid == 0u) tokens[p.tok_out_idx] = int(si[0]);
 }
+
+
+struct DflVfArgmaxP {
+  uint V, R, d, nchunks, tok_base;
+};
+
+[[kernel]] void dflare_vf_argmax_s1(const device float* logits [[buffer(0)]], device float* out_v [[buffer(1)]],
+                                    device uint* out_i [[buffer(2)]], constant DflVfArgmaxP& p [[buffer(3)]],
+                                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float sv[8];
+  threadgroup uint si[8];
+  const uint row = tg.y, chunk = tg.x;
+  const device float* lr = logits + size_t(row) * p.V;
+  const uint base = chunk * 4096u;
+  float best_v = -INFINITY;
+  uint best_i = 0u;
+  for (uint j = tid; j < 4096u; j += 256u) {
+    const uint idx = base + j;
+    if (idx < p.V) {
+      const float v = lr[idx];
+      if (v > best_v || (v == best_v && idx < best_i)) {
+        best_v = v;
+        best_i = idx;
+      }
+    }
+  }
+  const float mv = simd_max(best_v);
+  const uint cand = (best_v == mv) ? best_i : 0xFFFFFFFFu;
+  const uint mi = simd_min(cand);
+  if (lane == 0u) {
+    sv[sg] = mv;
+    si[sg] = mi;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0u) {
+    float fv = sv[0];
+    uint fi = si[0];
+    for (uint g = 1u; g < 8u; ++g) {
+      if (sv[g] > fv || (sv[g] == fv && si[g] < fi)) {
+        fv = sv[g];
+        fi = si[g];
+      }
+    }
+    const uint o = row * p.nchunks + chunk;
+    out_v[o] = fv;
+    out_i[o] = fi;
+  }
+}
+
+[[kernel]] void dflare_vf_argmax_s2(const device float* in_v [[buffer(0)]], const device uint* in_i [[buffer(1)]],
+                                    const device int* tokens [[buffer(2)]], device int* pkt [[buffer(3)]],
+                                    constant DflVfArgmaxP& p [[buffer(4)]], uint sg [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup int row_tok[8];
+  if (sg < p.R) {
+    const uint base = sg * p.nchunks;
+    float best_v = -INFINITY;
+    uint best_i = 0xFFFFFFFFu;
+    for (uint c = lane; c < p.nchunks; c += 32u) {
+      const float v = in_v[base + c];
+      const uint idx = in_i[base + c];
+      if (v > best_v || (v == best_v && idx < best_i)) {
+        best_v = v;
+        best_i = idx;
+      }
+    }
+    const float mv = simd_max(best_v);
+    const uint cand = (best_v == mv) ? best_i : 0xFFFFFFFFu;
+    const uint mi = simd_min(cand);
+    if (lane == 0u) row_tok[sg] = int(mi);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0u && lane == 0u) {
+    uint a = 0u;
+    int bonus = 0;
+    for (uint k = 0u; k < p.d; ++k) {
+      if (row_tok[k] == tokens[p.tok_base + k]) {
+        ++a;
+      } else {
+        bonus = row_tok[k];
+        break;
+      }
+    }
+    if (a == p.d) bonus = row_tok[p.d];
+    pkt[0] = int(a);
+    pkt[1] = bonus;
+  }
+}
